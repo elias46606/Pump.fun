@@ -1,0 +1,688 @@
+From c10ecf8f72d29113cb2d20da66f8bcd03815b294 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 15:52:30 +0000
+Subject: [PATCH] backend: opt-in local ban check for GET
+ /moderation/ban/address/{address}
+
+Implement the moderation.read operation from the public developer OpenAPI
+contract only. A supplied ban list (moderationStore / MODERATION_BANS_FILE)
+answers true for permanent and unexpired temporary bans and false otherwise,
+with expiry evaluated per request. Without a store the existing fixture
+replay and 501 fallback are unchanged. No captured website code is used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HRcHoTaM9RXi6jpZYMgvr7
+---
+ app/.env.example                              |   3 +
+ app/packages/backend/MODERATION.md            |  67 ++++
+ app/packages/backend/src/app.ts               |   8 +-
+ app/packages/backend/src/moderation-routes.ts |  40 +++
+ app/packages/backend/src/moderation-store.ts  | 143 ++++++++
+ app/packages/backend/src/server.ts            |   4 +-
+ app/packages/backend/test/moderation.test.ts  | 306 ++++++++++++++++++
+ 7 files changed, 569 insertions(+), 2 deletions(-)
+ create mode 100644 app/packages/backend/MODERATION.md
+ create mode 100644 app/packages/backend/src/moderation-routes.ts
+ create mode 100644 app/packages/backend/src/moderation-store.ts
+ create mode 100644 app/packages/backend/test/moderation.test.ts
+
+diff --git a/app/.env.example b/app/.env.example
+index 7936ac0..d20620d 100644
+--- a/app/.env.example
++++ b/app/.env.example
+@@ -5,6 +5,9 @@ BACKEND_URL=http://127.0.0.1:3001
+ # Optional server-owned confirmed-payout facts; absent preserves fixture/501.
+ # No live payout service or credentials. See packages/backend/PAYOUTS.md.
+ # PAYOUTS_FILE=/absolute/path/to/local-payouts.json
++# Optional server-owned local ban list; absent preserves fixture/501.
++# No moderation service or credentials. See packages/backend/MODERATION.md.
++# MODERATION_BANS_FILE=/absolute/path/to/local-bans.json
+ # Server-only Solana mainnet RPC for /portfolio. Unset = live reads disabled (503).
+ # To enable explicitly, set a public HTTPS mainnet provider; never expose its URL
+ # in NEXT_PUBLIC_* variables. Example:
+diff --git a/app/packages/backend/MODERATION.md b/app/packages/backend/MODERATION.md
+new file mode 100644
+index 0000000..3231501
+--- /dev/null
++++ b/app/packages/backend/MODERATION.md
+@@ -0,0 +1,67 @@
++# Opt-in local address ban check
++
++`GET /v1/moderation/ban/address/{address}` now has an independently implemented,
++opt-in read model over a supplied ban list. Without `moderationStore` /
++`MODERATION_BANS_FILE`, the existing explicit fixture replay or
++`501 COMPATIBILITY_NOT_IMPLEMENTED` remains. No ban list is enabled by default.
++This does not implement issuing, lifting or appealing bans, moderation tooling,
++reasons, audit history, wallet ownership, sessions, a production proxy or a
++native-compatible moderation service.
++
++## Declared source
++
++- Developer operation `get_moderation_ban_address_by_address`, scope
++  `moderation.read`, declared origin `https://api.pump.fun/v1`.
++- OpenAPI 0.294.0: `contracts/developer.openapi.json`, SHA-256
++  `ad2fdc2bbf0b86d92e01f539ca609fff8164fcc44556bb2691378a869f73ad73`.
++  The success schema is a bare boolean: "true while the address is banned (a
++  permanent ban, or a temporary ban that has not expired); false otherwise.
++  Never null." Tests check real in-process responses against that schema.
++
++The implementation uses only this public contract. No captured website code,
++factory or upstream response informs it.
++
++## Local data model
++
++```json
++{
++  "schemaVersion": 1,
++  "dataSource": "synthetic",
++  "observedAt": "2026-10-28T00:00:00.000Z",
++  "bans": [
++    { "address": "SyntheticPermanentBan1111111111111111111111", "expiresAt": null },
++    { "address": "SyntheticTemporaryBan1111111111111111111111", "expiresAt": "2026-10-29T00:00:00.000Z" }
++  ]
++}
++```
++
++- `expiresAt: null` is a permanent ban. A timestamp must be canonical
++  millisecond ISO-8601 UTC; the ban is active strictly before that instant and
++  is evaluated per request against the clock, not at load time.
++- Addresses are opaque, compared verbatim: no case folding, trimming, base58
++  decoding or chain inference. Empty, whitespace/control-containing, over-128
++  character and duplicate addresses reject the whole dataset.
++- `dataSource` is `synthetic` or `local-materialized`. Unknown keys, sparse
++  arrays and other schema versions are rejected.
++- The startup loader reads one bounded (8 MiB) regular file, refuses symlinks,
++  and decodes UTF-8 fatally. No reloads, writes or network access.
++
++## Response and explicit local boundaries
++
++- `200` with `true` or `false` and `Content-Type: application/json`. `false`
++  means only "not actively banned in this supplied list"; it is never a
++  production verdict.
++- Successful responses carry `Cache-Control: no-store`,
++  `X-Reconstruction-Data-Source`, `X-Reconstruction-Observed-At` and
++  `X-Reconstruction-Compatibility: unqualified`.
++- The operation declares no query parameters. Any query returns local
++  `501 COMPATIBILITY_NOT_IMPLEMENTED` with reason
++  `MODERATION_QUERY_UNSUPPORTED`. This envelope is local policy, not a captured
++  production response.
++- The existing native `apiKeyGate` runs first. This does not implement
++  production key verification, scope authorization or rate-limit headers.
++
++`test/moderation.test.ts` covers permanent, unexpired, exactly-expired and
++unlisted addresses, the per-request clock, verbatim matching, the query
++boundary, the key gate, default 501 and fixture preservation, dataset
++validation and the startup loader. No feature-wide completion credit is added.
+diff --git a/app/packages/backend/src/app.ts b/app/packages/backend/src/app.ts
+index 8605647..2902835 100644
+--- a/app/packages/backend/src/app.ts
++++ b/app/packages/backend/src/app.ts
+@@ -11,6 +11,8 @@ import type { UserTradesStore } from "./user-trades-store.js";
+ import { registerUserTradesRoutes, USER_TRADES_NATIVE_ROUTES } from "./user-trades-routes.js";
+ import { apiKeyGate } from "./api-key-gate.js";
+ import { registerSearchResolveRoutes, SEARCH_RESOLVE_NATIVE_ROUTES } from "./search-resolve-routes.js";
++import type { ModerationStore } from "./moderation-store.js";
++import { registerModerationRoutes, MODERATION_NATIVE_ROUTES } from "./moderation-routes.js";
+ import { createHash } from "node:crypto";
+ import { readFileSync } from "node:fs";
+ import { validateHeaderName, validateHeaderValue } from "node:http";
+@@ -318,6 +320,8 @@ export interface BuildAppOptions {
+   payoutsStore?: PayoutsStore;
+   /** Explicit operator-owned spot trade history; absent retains fixture/501 behavior. */
+   userTradesStore?: UserTradesStore;
++  /** Explicit local ban list; absent retains fixture/501 behavior. */
++  moderationStore?: ModerationStore;
+   /** Explicit local/CLI-only capability; absent by default, independent of developer auth. */
+   localMedia?: LocalMediaOptions;
+   /** Override the user store (for tests). */
+@@ -412,6 +416,7 @@ export function buildApp(fixtures: Fixture[] = [], opts: BuildAppOptions = {}) {
+     if (opts.positionsStore) registerPositionsRoutes(native, opts.positionsStore);
+     if (opts.payoutsStore) registerPayoutRoutes(native, opts.payoutsStore);
+     if (opts.userTradesStore) registerUserTradesRoutes(native, opts.userTradesStore);
++    if (opts.moderationStore) registerModerationRoutes(native, opts.moderationStore);
+   });
+ 
+   // Routing recognizes documented paths; no fabricated domain responses or live proxy fallback.
+@@ -429,7 +434,8 @@ export function buildApp(fixtures: Fixture[] = [], opts: BuildAppOptions = {}) {
+         (opts.calloutsStore && CALLOUTS_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
+         (opts.positionsStore && POSITIONS_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
+         (opts.payoutsStore && PAYOUTS_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
+-        (opts.userTradesStore && USER_TRADES_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`))) continue;
++        (opts.userTradesStore && USER_TRADES_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
++        (opts.moderationStore && MODERATION_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`))) continue;
+       app.route({
+         method: method.toUpperCase() as "GET",
+         url: "/v1" + path.replace(/\{([^}]+)\}/g, ":$1"),
+diff --git a/app/packages/backend/src/moderation-routes.ts b/app/packages/backend/src/moderation-routes.ts
+new file mode 100644
+index 0000000..f5dfbe1
+--- /dev/null
++++ b/app/packages/backend/src/moderation-routes.ts
+@@ -0,0 +1,40 @@
++import type { FastifyInstance } from "fastify";
++import type { operations } from "./generated/developer-api.js";
++import type { ModerationStore } from "./moderation-store.js";
++
++type BanResponse =
++  operations["get_moderation_ban_address_by_address"]["responses"][200]["content"]["application/json"];
++export const MODERATION_NATIVE_ROUTES = new Set([
++  "GET /moderation/ban/address/{address}",
++]);
++
++/** Must be registered inside the existing developer API-key compatibility gate. */
++export function registerModerationRoutes(
++  app: FastifyInstance,
++  store: ModerationStore,
++): void {
++  app.get<{ Params: { address: string } }>(
++    "/v1/moderation/ban/address/:address",
++    async (request, reply) => {
++      const separator = request.url.indexOf("?");
++      // The operation declares no query parameters; do not guess their meaning.
++      if (separator >= 0 && request.url.length > separator + 1) {
++        return reply.code(501).send({
++          statusCode: 501,
++          error: "COMPATIBILITY_NOT_IMPLEMENTED",
++          reason: "MODERATION_QUERY_UNSUPPORTED",
++        });
++      }
++      const banned: BanResponse = store.isBanned(request.params.address);
++      // A verdict within this supplied local list, never a production ban decision.
++      // The body is a bare JSON boolean, which Fastify will not serialize itself.
++      return reply
++        .type("application/json")
++        .header("Cache-Control", "no-store")
++        .header("X-Reconstruction-Data-Source", store.dataSource)
++        .header("X-Reconstruction-Observed-At", store.observedAt)
++        .header("X-Reconstruction-Compatibility", "unqualified")
++        .send(JSON.stringify(banned));
++    },
++  );
++}
+diff --git a/app/packages/backend/src/moderation-store.ts b/app/packages/backend/src/moderation-store.ts
+new file mode 100644
+index 0000000..bfbe65a
+--- /dev/null
++++ b/app/packages/backend/src/moderation-store.ts
+@@ -0,0 +1,143 @@
++import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
++
++/** Local inputs, not a recovered moderation schema or production ban registry. */
++export interface ModerationBan {
++  address: string;
++  /** null is a permanent ban; otherwise the ban is active strictly before this instant. */
++  expiresAt: string | null;
++}
++export interface ModerationDataset {
++  schemaVersion: 1;
++  dataSource: "synthetic" | "local-materialized";
++  observedAt: string;
++  bans: ModerationBan[];
++}
++
++const MAX_FILE_BYTES = 8 * 1024 * 1024;
++const MAX_BANS = 100_000;
++function invalid(field: string): never {
++  throw new TypeError(`Invalid local moderation dataset: ${field}`);
++}
++function record(value: unknown, keys: readonly string[], field: string) {
++  if (
++    !value ||
++    typeof value !== "object" ||
++    Array.isArray(value) ||
++    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
++  )
++    invalid(field);
++  const item = value as Record<string, unknown>;
++  if (
++    Object.keys(item).length !== keys.length ||
++    keys.some((key) => !Object.hasOwn(item, key))
++  )
++    invalid(field);
++  return item;
++}
++function text(value: unknown, field: string): string {
++  if (
++    typeof value !== "string" ||
++    !value.length ||
++    value.length > 128 ||
++    /[\u0000- \u007f]/u.test(value)
++  )
++    invalid(field);
++  return value;
++}
++function timestamp(value: unknown, field: string): number {
++  const result = text(value, field);
++  const ms = Date.parse(result);
++  if (
++    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(result) ||
++    !Number.isFinite(ms) ||
++    new Date(ms).toISOString() !== result
++  )
++    invalid(field);
++  return ms;
++}
++
++/**
++ * Exact-address ban lookup over an explicitly supplied local list. Addresses are
++ * compared verbatim: base58 is case-sensitive and no chain or format is inferred.
++ */
++export class ModerationStore {
++  readonly dataSource: ModerationDataset["dataSource"];
++  readonly observedAt: string;
++  readonly #expiries = new Map<string, number | null>();
++  readonly #now: () => number;
++
++  constructor(input: unknown, now: () => number = Date.now) {
++    const dataset = record(
++      input,
++      ["schemaVersion", "dataSource", "observedAt", "bans"],
++      "dataset",
++    );
++    if (dataset.schemaVersion !== 1) invalid("schemaVersion");
++    if (
++      !["synthetic", "local-materialized"].includes(
++        dataset.dataSource as string,
++      )
++    )
++      invalid("dataSource");
++    timestamp(dataset.observedAt, "observedAt");
++    const bans = dataset.bans;
++    if (!Array.isArray(bans) || bans.length > MAX_BANS) invalid("bans");
++    for (let index = 0; index < bans.length; index++) {
++      if (!Object.hasOwn(bans, index)) invalid(`bans[${index}]`);
++      const ban = record(
++        bans[index],
++        ["address", "expiresAt"],
++        `bans[${index}]`,
++      );
++      const address = text(ban.address, `bans[${index}].address`);
++      // One fact per address; a later row must not silently override an earlier one.
++      if (this.#expiries.has(address))
++        invalid(`bans[${index}].address duplicate`);
++      this.#expiries.set(
++        address,
++        ban.expiresAt === null
++          ? null
++          : timestamp(ban.expiresAt, `bans[${index}].expiresAt`),
++      );
++    }
++    this.dataSource = dataset.dataSource as ModerationDataset["dataSource"];
++    this.observedAt = dataset.observedAt as string;
++    this.#now = now;
++  }
++
++  /** True for a permanent ban or an unexpired temporary ban in this local list only. */
++  isBanned(address: string): boolean {
++    if (!this.#expiries.has(address)) return false;
++    const expiresAt = this.#expiries.get(address)!;
++    return expiresAt === null || this.#now() < expiresAt;
++  }
++}
++
++/** Startup-only, bounded regular-file read. No writes, reloads or network. */
++export function loadModerationStore(path: string): ModerationStore {
++  const fd = openSync(
++    path,
++    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
++  );
++  try {
++    const stat = fstatSync(fd);
++    if (!stat.isFile() || stat.size > MAX_FILE_BYTES) invalid("file type/size");
++    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
++    let size = 0;
++    while (size < buffer.length) {
++      const count = readSync(fd, buffer, size, buffer.length - size, null);
++      if (count === 0) break;
++      size += count;
++    }
++    if (size > MAX_FILE_BYTES) invalid("file size");
++    return new ModerationStore(
++      JSON.parse(
++        new TextDecoder("utf-8", { fatal: true }).decode(
++          buffer.subarray(0, size),
++        ),
++      ),
++    );
++  } finally {
++    closeSync(fd);
++  }
++}
+diff --git a/app/packages/backend/src/server.ts b/app/packages/backend/src/server.ts
+index c0506f2..d6efca0 100644
+--- a/app/packages/backend/src/server.ts
++++ b/app/packages/backend/src/server.ts
+@@ -7,6 +7,7 @@ import { loadPayoutsStore } from './payouts-store.js';
+ import { loadUserTradesStore } from './user-trades-store.js';
+ import { startWithLocalMedia } from './local-media-runtime.js';
+ import { loadPortfolioBalancesStore } from './portfolio-balances-store.js';
++import { loadModerationStore } from './moderation-store.js';
+ // The sibling startup loaders (callouts, positions, portfolio balances) all
+ // reject malformed UTF-8 with a fatal decoder. Fixtures must fail the same
+ // way: a lossy "utf8" read would silently replace corrupted bytes with
+@@ -19,8 +20,9 @@ const calloutDiscussionsStore = process.env.CALLOUT_DISCUSSIONS_FILE ? loadCallo
+ const positionsStore = process.env.POSITIONS_FILE ? loadPositionsStore(process.env.POSITIONS_FILE) : undefined;
+ const payoutsStore = loadPayoutsStore(process.env.PAYOUTS_FILE);
+ const userTradesStore = process.env.TRADES_FILE ? loadUserTradesStore(process.env.TRADES_FILE) : undefined;
++const moderationStore = process.env.MODERATION_BANS_FILE ? loadModerationStore(process.env.MODERATION_BANS_FILE) : undefined;
+ const app = await startWithLocalMedia(process.env, async (localMedia) => {
+-  const app = buildApp(fixtures, { calloutsStore, calloutDiscussionsStore, positionsStore, payoutsStore, userTradesStore, portfolioBalancesStore, localMedia });
++  const app = buildApp(fixtures, { calloutsStore, calloutDiscussionsStore, positionsStore, payoutsStore, userTradesStore, moderationStore, portfolioBalancesStore, localMedia });
+   try {
+     await app.listen({ host: process.env.HOST ?? '127.0.0.1', port: Number(process.env.PORT ?? 3001) });
+   } catch (startupError) {
+diff --git a/app/packages/backend/test/moderation.test.ts b/app/packages/backend/test/moderation.test.ts
+new file mode 100644
+index 0000000..8c87cad
+--- /dev/null
++++ b/app/packages/backend/test/moderation.test.ts
+@@ -0,0 +1,306 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  mkdtempSync,
++  readFileSync,
++  rmSync,
++  symlinkSync,
++  writeFileSync,
++} from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { buildApp } from "../src/app.js";
++import {
++  ModerationStore,
++  loadModerationStore,
++  type ModerationDataset,
++} from "../src/moderation-store.js";
++import { assertSchema } from "../src/schema-validator.js";
++
++// Synthetic shape-only credential for in-process compatibility-gate tests.
++const headers = { authorization: `Bearer pf_live_${"a".repeat(49)}` };
++const now = Date.parse("2026-10-29T00:00:00.000Z");
++const spec = JSON.parse(
++  readFileSync(
++    new URL("../../../contracts/developer.openapi.json", import.meta.url),
++    "utf8",
++  ),
++);
++// Synthetic addresses only; none identifies a real wallet.
++function dataset(): ModerationDataset {
++  return {
++    schemaVersion: 1,
++    dataSource: "synthetic",
++    observedAt: "2026-10-28T00:00:00.000Z",
++    bans: [
++      {
++        address: "SyntheticPermanentBan1111111111111111111111",
++        expiresAt: null,
++      },
++      {
++        address: "SyntheticTemporaryBan1111111111111111111111",
++        expiresAt: "2026-10-29T00:00:00.001Z",
++      },
++      {
++        address: "SyntheticExpiredBan11111111111111111111111",
++        expiresAt: "2026-10-29T00:00:00.000Z",
++      },
++    ],
++  };
++}
++function contract(body: unknown) {
++  assertSchema(
++    body,
++    spec.paths["/moderation/ban/address/{address}"].get.responses["200"]
++      .content["application/json"].schema,
++    "moderation ban check",
++    spec,
++  );
++}
++async function withApp(
++  run: (app: ReturnType<typeof buildApp>) => Promise<void>,
++  store: ModerationStore | undefined = new ModerationStore(
++    dataset(),
++    () => now,
++  ),
++) {
++  const app = buildApp([], { moderationStore: store });
++  try {
++    await run(app);
++  } finally {
++    await app.close();
++  }
++}
++const url = (address: string) =>
++  `/v1/moderation/ban/address/${encodeURIComponent(address)}`;
++
++test("permanent and unexpired temporary bans read true; expired and unlisted read false", async () => {
++  await withApp(async (app) => {
++    for (const [address, expected] of [
++      ["SyntheticPermanentBan1111111111111111111111", true],
++      ["SyntheticTemporaryBan1111111111111111111111", true],
++      // expiresAt is exclusive: a ban expiring exactly now is no longer active.
++      ["SyntheticExpiredBan11111111111111111111111", false],
++      ["SyntheticNeverBanned1111111111111111111111", false],
++    ] as const) {
++      const res = await app.inject({
++        method: "GET",
++        url: url(address),
++        headers,
++      });
++      assert.equal(res.statusCode, 200, address);
++      assert.match(String(res.headers["content-type"]), /^application\/json/);
++      assert.equal(res.body, String(expected));
++      contract(res.json());
++      assert.equal(res.headers["cache-control"], "no-store");
++      assert.equal(res.headers["x-reconstruction-data-source"], "synthetic");
++      assert.equal(
++        res.headers["x-reconstruction-observed-at"],
++        "2026-10-28T00:00:00.000Z",
++      );
++      assert.equal(
++        res.headers["x-reconstruction-compatibility"],
++        "unqualified",
++      );
++    }
++  });
++});
++
++test("temporary bans follow the injected clock instead of a load-time snapshot", async () => {
++  let clock = now;
++  await withApp(
++    async (app) => {
++      const address = url("SyntheticTemporaryBan1111111111111111111111");
++      assert.equal(
++        (await app.inject({ method: "GET", url: address, headers })).body,
++        "true",
++      );
++      clock += 1;
++      assert.equal(
++        (await app.inject({ method: "GET", url: address, headers })).body,
++        "false",
++      );
++    },
++    new ModerationStore(dataset(), () => clock),
++  );
++});
++
++test("addresses match verbatim without case folding or trimming", async () => {
++  await withApp(async (app) => {
++    for (const address of [
++      "syntheticpermanentban1111111111111111111111",
++      " SyntheticPermanentBan1111111111111111111111",
++    ]) {
++      const res = await app.inject({
++        method: "GET",
++        url: url(address),
++        headers,
++      });
++      assert.equal(res.statusCode, 200);
++      assert.equal(res.body, "false");
++    }
++  });
++});
++
++test("undeclared query parameters return an explicit local 501", async () => {
++  await withApp(async (app) => {
++    const res = await app.inject({
++      method: "GET",
++      url: `${url("SyntheticPermanentBan1111111111111111111111")}?includeExpired=true`,
++      headers,
++    });
++    assert.equal(res.statusCode, 501);
++    assert.equal(res.json().reason, "MODERATION_QUERY_UNSUPPORTED");
++  });
++});
++
++test("the existing API-key gate runs before the ban lookup", async () => {
++  await withApp(async (app) => {
++    for (const credential of [undefined, "Bearer invalid"]) {
++      const res = await app.inject({
++        method: "GET",
++        url: url("SyntheticPermanentBan1111111111111111111111"),
++        headers: credential ? { authorization: credential } : {},
++      });
++      assert.equal(res.statusCode, 401);
++      assert.notEqual(res.body, "true");
++    }
++  });
++});
++
++test("without an injected store the route keeps the 501 fallback and fixtures still replay", async () => {
++  const fallback = buildApp();
++  try {
++    const res = await fallback.inject({
++      method: "GET",
++      url: url("SyntheticPermanentBan1111111111111111111111"),
++      headers,
++    });
++    assert.equal(res.statusCode, 501);
++    assert.equal(res.json().error, "COMPATIBILITY_NOT_IMPLEMENTED");
++  } finally {
++    await fallback.close();
++  }
++  const replay = buildApp([
++    {
++      method: "GET",
++      path: "/v1/moderation/ban/address/SyntheticFixture",
++      status: 200,
++      body: true,
++      source: "synthetic moderation fixture",
++    },
++  ]);
++  try {
++    const res = await replay.inject({
++      method: "GET",
++      url: "/v1/moderation/ban/address/SyntheticFixture",
++      headers,
++    });
++    assert.equal(res.statusCode, 200);
++    assert.equal(res.body, "true");
++  } finally {
++    await replay.close();
++  }
++});
++
++test("malformed datasets are rejected at construction", () => {
++  const cases: Array<[string, (data: any) => void]> = [
++    [
++      "schemaVersion",
++      (data) => {
++        data.schemaVersion = 2;
++      },
++    ],
++    [
++      "dataSource",
++      (data) => {
++        data.dataSource = "production";
++      },
++    ],
++    [
++      "observedAt",
++      (data) => {
++        data.observedAt = "2026-10-28";
++      },
++    ],
++    [
++      "extra key",
++      (data) => {
++        data.extra = true;
++      },
++    ],
++    [
++      "duplicate address",
++      (data) => {
++        data.bans.push({ address: data.bans[0].address, expiresAt: null });
++      },
++    ],
++    [
++      "empty address",
++      (data) => {
++        data.bans[0].address = "";
++      },
++    ],
++    [
++      "whitespace address",
++      (data) => {
++        data.bans[0].address = "Synthetic Ban";
++      },
++    ],
++    [
++      "oversized address",
++      (data) => {
++        data.bans[0].address = "a".repeat(129);
++      },
++    ],
++    [
++      "non-canonical expiry",
++      (data) => {
++        data.bans[1].expiresAt = "2026-10-29T00:00:00Z";
++      },
++    ],
++    [
++      "missing expiry",
++      (data) => {
++        delete data.bans[1].expiresAt;
++      },
++    ],
++    [
++      "sparse bans",
++      (data) => {
++        data.bans = [, data.bans[0]];
++      },
++    ],
++  ];
++  for (const [label, mutate] of cases) {
++    const data = structuredClone(dataset()) as any;
++    mutate(data);
++    assert.throws(() => new ModerationStore(data), TypeError, label);
++  }
++});
++
++test("startup loader reads a bounded regular UTF-8 file and rejects symlinks and invalid bytes", () => {
++  const directory = mkdtempSync(join(tmpdir(), "moderation-"));
++  try {
++    const file = join(directory, "bans.json");
++    writeFileSync(file, JSON.stringify(dataset()));
++    const store = loadModerationStore(file);
++    assert.equal(
++      store.isBanned("SyntheticPermanentBan1111111111111111111111"),
++      true,
++    );
++    assert.equal(store.dataSource, "synthetic");
++
++    const link = join(directory, "link.json");
++    symlinkSync(file, link);
++    assert.throws(() => loadModerationStore(link));
++
++    const corrupt = join(directory, "corrupt.json");
++    writeFileSync(corrupt, Buffer.from([0x7b, 0xff, 0x7d]));
++    assert.throws(() => loadModerationStore(corrupt), TypeError);
++
++    assert.throws(() => loadModerationStore(directory));
++  } finally {
++    rmSync(directory, { recursive: true, force: true });
++  }
++});
+-- 
+2.43.0
+
